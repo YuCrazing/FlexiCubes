@@ -8,7 +8,7 @@
 import numpy as np
 import torch
 import trimesh
-import kaolin
+# import kaolin
 import nvdiffrast.torch as dr
 
 ###############################################################################
@@ -39,13 +39,41 @@ def translate(x, y, z, device=None):
 
 @torch.no_grad()
 def random_rotation_translation(t, device=None):
-    m = np.random.normal(size=[3, 3])
-    m[1] = np.cross(m[0], m[2])
-    m[2] = np.cross(m[0], m[1])
-    m = m / np.linalg.norm(m, axis=1, keepdims=True)
-    m = np.pad(m, [[0, 1], [0, 1]], mode='constant')
-    m[3, 3] = 1.0
-    m[:3, 3] = np.random.uniform(-t, t, size=[3])
+    m = np.identity(4)
+    
+    # Generate front, right, back, left 4 views randomly
+    xyz = np.random.choice([1], size=3)
+    if xyz[0] == 0:
+        theta = np.random.choice([0, np.pi/2, np.pi, -np.pi/2])
+        # theta = np.random.choice([np.pi])
+        m[:3, :3] = np.array([[1, 0, 0],
+                            [0, np.cos(theta), -np.sin(theta)],
+                            [0, np.sin(theta), np.cos(theta)]])
+    elif xyz[0] == 1:
+        theta = np.random.choice([0, np.pi/2, np.pi, -np.pi/2])
+        # theta = np.random.choice([-np.pi/2])
+        # theta = np.random.choice([0, np.pi/2, np.pi, -np.pi/2, -np.pi/2, -np.pi/2, -np.pi/2])
+        m[:3, :3] = np.array([[np.cos(theta), 0, np.sin(theta)],
+                            [0, 1, 0],
+                            [-np.sin(theta), 0, np.cos(theta)]])
+    else:
+        theta = np.random.choice([0, np.pi/2, np.pi, -np.pi/2])
+        m[:3, :3] = np.array([[np.cos(theta), -np.sin(theta), 0],
+                            [np.sin(theta), np.cos(theta), 0],
+                            [0, 0, 1]])
+    
+    # m = np.random.normal(size=[3, 3])
+    # m[1] = np.cross(m[0], m[2])
+    # m[2] = np.cross(m[0], m[1])
+    # m = m / np.linalg.norm(m, axis=1, keepdims=True)
+    # m = np.pad(m, [[0, 1], [0, 1]], mode='constant')
+    # m[3, 3] = 1.0
+    # m[:3, 3] = np.random.uniform(-t, t, size=[3])
+
+    # m[:3, 3] = 0
+    # print("sdf")
+    # front view
+    # m[:3, 3] = np.array([0, 0, -3])
     return torch.tensor(m, dtype=torch.float32, device=device)
 
 def rotate_x(a, device=None):
@@ -63,9 +91,10 @@ def rotate_y(a, device=None):
                          [ 0, 0, 0, 1]], dtype=torch.float32, device=device)
     
 class Mesh:
-    def __init__(self, vertices, faces):
+    def __init__(self, vertices, faces, uv=None):
         self.vertices = vertices
         self.faces = faces
+        self.uv = uv
         
     def auto_normals(self):
         v0 = self.vertices[self.faces[:, 0], :]
@@ -74,19 +103,39 @@ class Mesh:
         nrm = safe_normalize(torch.cross(v1 - v0, v2 - v0))
         self.nrm = nrm
 
+        face_normals = safe_normalize(torch.cross(v1 - v0, v2 - v0))
+        face_area = torch.norm(face_normals, dim=1, keepdim=True)
+        vertex_normals = torch.zeros_like(self.vertices)
+
+        indices = self.faces.view(-1)  # Flatten index tensor
+        normals_expanded = (face_normals*face_area).repeat(1, 3).view(-1, 3)  # Repeat each normal 3 times and flatten
+        # Use index_add_ for accumulating face normals for each vertex
+        vertex_normals.index_add_(0, indices, normals_expanded)
+        # Normalize the vertex normals
+        self.v_nrm = safe_normalize(vertex_normals)
+
+        # for i in range(self.faces.shape[0]):
+        #     vertex_normals[self.faces[i, 0], :] += face_normals[i, :]
+        #     vertex_normals[self.faces[i, 1], :] += face_normals[i, :]
+        #     vertex_normals[self.faces[i, 2], :] += face_normals[i, :]
+        # self.v_nrm = safe_normalize(vertex_normals)
+
+
 def load_mesh(path, device):
     mesh_np = trimesh.load(path)
     vertices = torch.tensor(mesh_np.vertices, device=device, dtype=torch.float)
     faces = torch.tensor(mesh_np.faces, device=device, dtype=torch.long)
-    
+    uv = torch.tensor(mesh_np.visual.uv, device=device, dtype=torch.float)
+
     # Normalize
     vmin, vmax = vertices.min(dim=0)[0], vertices.max(dim=0)[0]
     scale = 1.8 / torch.max(vmax - vmin).item()
     vertices = vertices - (vmax + vmin) / 2 # Center mesh on origin
     vertices = vertices * scale # Rescale to [-0.9, 0.9]
-    return Mesh(vertices, faces)
+    return Mesh(vertices, faces, uv)
 
 def compute_sdf(points, vertices, faces):
+    import kaolin
     face_vertices = kaolin.ops.mesh.index_vertices_by_faces(vertices.clone().unsqueeze(0), faces)
     distance = kaolin.metrics.trianglemesh.point_to_mesh_distance(points.unsqueeze(0), face_vertices)[0]
     with torch.no_grad():
@@ -95,6 +144,7 @@ def compute_sdf(points, vertices, faces):
     return sdf
 
 def sample_random_points(n, mesh):
+    import kaolin
     pts_random = (torch.rand((n//2,3),device='cuda') - 0.5) * 2
     pts_surface = kaolin.ops.mesh.sample_points(mesh.vertices.unsqueeze(0), mesh.faces, 500)[0].squeeze(0)
     pts_surface += torch.randn_like(pts_surface) * 0.05

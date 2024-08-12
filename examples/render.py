@@ -12,7 +12,6 @@ from ipywidgets import interactive, HBox, VBox, FloatLogSlider, IntSlider
 
 import torch
 import nvdiffrast.torch as dr
-import kaolin as kal
 import util
 
 ###############################################################################
@@ -21,13 +20,26 @@ import util
 
 def get_random_camera_batch(batch_size, fovy = np.deg2rad(45), iter_res=[512,512], cam_near_far=[0.1, 1000.0], cam_radius=3.0, device="cuda", use_kaolin=True):
     if use_kaolin:
+        import kaolin as kal
+        # camera_pos = torch.stack(kal.ops.coords.spherical2cartesian(
+        #     *kal.ops.random.sample_spherical_coords((batch_size,), azimuth_low=0., azimuth_high=math.pi * 2,
+        #                                             elevation_low=-math.pi / 2., elevation_high=math.pi / 2., device='cuda'),
+        #     cam_radius
+        # ), dim=-1)
+
+        # Generating from front, right, left, back 4 viewpoints randomly
+        # camera_pos = torch.stack(kal.ops.coords.spherical2cartesian(
+        #     torch.tensor([0., math.pi / 2., math.pi, -math.pi / 2.], device='cuda').repeat(batch_size),
+        #     torch.tensor([0.4, 0.4, 0.4, 0.4], device='cuda').repeat(batch_size),
+        #     cam_radius
+        # ), dim=-1)
         camera_pos = torch.stack(kal.ops.coords.spherical2cartesian(
-            *kal.ops.random.sample_spherical_coords((batch_size,), azimuth_low=0., azimuth_high=math.pi * 2,
-                                                    elevation_low=-math.pi / 2., elevation_high=math.pi / 2., device='cuda'),
+            torch.tensor([0., math.pi], device='cuda').repeat(batch_size),
+            torch.tensor([0.4, 0.4, 0.4, 0.4], device='cuda').repeat(batch_size),
             cam_radius
         ), dim=-1)
         return kal.render.camera.Camera.from_args(
-            eye=camera_pos + torch.rand((batch_size, 1), device='cuda') * 0.5 - 0.25,
+            eye=camera_pos ,#+ torch.rand((batch_size, 1), device='cuda') * 0.5 - 0.25,
             at=torch.zeros(batch_size, 3),
             up=torch.tensor([[0., 1., 0.]]),
             fov=fovy,
@@ -51,6 +63,7 @@ def get_random_camera_batch(batch_size, fovy = np.deg2rad(45), iter_res=[512,512
 
 def get_rotate_camera(itr, fovy = np.deg2rad(45), iter_res=[512,512], cam_near_far=[0.1, 1000.0], cam_radius=3.0, device="cuda", use_kaolin=True):
     if use_kaolin:
+        import kaolin as kal
         ang = (itr / 10) * np.pi * 2
         camera_pos = torch.stack(kal.ops.coords.spherical2cartesian(torch.tensor(ang), torch.tensor(0.4), -torch.tensor(cam_radius)))
         return kal.render.camera.Camera.from_args(
@@ -73,6 +86,7 @@ def get_rotate_camera(itr, fovy = np.deg2rad(45), iter_res=[512,512], cam_near_f
 
 glctx = dr.RasterizeGLContext()
 def render_mesh(mesh, camera, iter_res, return_types = ["mask", "depth"], white_bg=False, wireframe_thickness=0.4):
+    import kaolin as kal
     vertices_camera = camera.extrinsics.transform(mesh.vertices)
     face_vertices_camera = kal.ops.mesh.index_vertices_by_faces(
         vertices_camera, mesh.faces
@@ -116,7 +130,7 @@ def render_mesh(mesh, camera, iter_res, return_types = ["mask", "depth"], white_
         
     return out_dict
 
-def render_mesh_paper(mesh, mv, mvp, iter_res, return_types = ["mask", "depth"], white_bg=False):
+def render_mesh_paper(mesh, mv, mvp, iter_res, return_types = ["mask", "depth"], white_bg=False, tex=None):
     '''
     The rendering function used to produce the results in the paper.
     '''
@@ -132,11 +146,65 @@ def render_mesh_paper(mesh, mv, mvp, iter_res, return_types = ["mask", "depth"],
             v_pos_cam = util.xfm_points(mesh.vertices.unsqueeze(0), mv)
             img, _ = util.interpolate(v_pos_cam, rast, mesh.faces.int())
         elif type == "normal" :
-            normal_indices = (torch.arange(0, mesh.nrm.shape[0], dtype=torch.int64, device='cuda')[:, None]).repeat(1, 3)
-            img, _ = util.interpolate(mesh.nrm.unsqueeze(0).contiguous(), rast, normal_indices.int())
+            img, _ = dr.interpolate(mesh.v_nrm.unsqueeze(0).contiguous(), rast, mesh.faces.int())
+            # normal_indices = (torch.arange(0, mesh.nrm.shape[0], dtype=torch.int64, device='cuda')[:, None]).repeat(1, 3)
+            # img, _ = util.interpolate(mesh.nrm.unsqueeze(0).contiguous(), rast, normal_indices.int())
+
+            # rotation_matrix = mv.detach().cpu().numpy()[:, :3, :3]#.transpose(0, 2, 1)
+            # normal_map = img.detach().cpu().numpy()
+            # new_img = np.zeros_like(img.detach().cpu().numpy())
+            # for i in range(normal_map.shape[1]):
+            #     for j in range(normal_map.shape[2]):
+            #         world_space_normal = normal_map[0, i, j]
+            #         # Multiply the normal vector by the rotation matrix to transform it
+            #         camera_space_normal = rotation_matrix @ world_space_normal
+            #         # Normalize the result since transformation might not preserve length
+            #         new_img[0, i, j] = camera_space_normal / np.linalg.norm(camera_space_normal)
+            # img = torch.tensor(new_img).to('cuda')
+
+
+            # Preallocate the new_img tensor with the same shape as normal_map
+            normal_map = img
+
+            rotation_matrix = mv[:, :3, :3]
+
+            # Move the rotation matrix to the same device as normal_map
+            # rotation_matrix = rotation_matrix.to(normal_map.device)
+
+            # Reshape the normal map and rotation matrix for broadcasting
+            normal_map = normal_map.view(-1, 3)
+            rotation_matrix = rotation_matrix.view(-1, 3, 3)
+
+            # Multiply the normal vectors by the rotation matrix
+            camera_space_normals = torch.matmul(rotation_matrix, normal_map.unsqueeze(-1)).squeeze(-1)
+
+            # Normalize the camera space normals
+            camera_space_normals = camera_space_normals / torch.max(torch.norm(camera_space_normals, dim=-1, keepdim=True), torch.tensor(1e-6, device=camera_space_normals.device))
+
+            # Reshape the camera space normals back to the original shape
+            img = camera_space_normals.view_as(img)
         elif type == "vertex_normal":
             img, _ = util.interpolate(mesh.v_nrm.unsqueeze(0).contiguous(), rast, mesh.faces.int())
-            img = dr.antialias((img + 1) * 0.5, rast, v_pos_clip, mesh.faces.int()) 
+            # img = dr.antialias((img + 1) * 0.5, rast, v_pos_clip, mesh.faces.int()) 
+
+            # Preallocate the new_img tensor with the same shape as normal_map
+            normal_map = img
+            rotation_matrix = mv[:, :3, :3]
+            # Move the rotation matrix to the same device as normal_map
+            # rotation_matrix = rotation_matrix.to(normal_map.device)
+            # Reshape the normal map and rotation matrix for broadcasting
+            normal_map = normal_map.view(-1, 3)
+            rotation_matrix = rotation_matrix.view(-1, 3, 3)
+            # Multiply the normal vectors by the rotation matrix
+            camera_space_normals = torch.matmul(rotation_matrix, normal_map.unsqueeze(-1)).squeeze(-1)
+            # Normalize the camera space normals
+            camera_space_normals = camera_space_normals / torch.max(torch.norm(camera_space_normals, dim=-1, keepdim=True), torch.tensor(1e-6, device=camera_space_normals.device))
+            # Reshape the camera space normals back to the original shape
+            img = camera_space_normals.view_as(img)
+        elif type == "color":
+            uv = mesh.uv
+            texc, _ = dr.interpolate(uv[None, ...], rast, mesh.faces.int())
+            img = dr.texture(tex[None, ...], texc, filter_mode='linear')
         if white_bg:
             bg = torch.ones_like(img)
             alpha = (rast[..., -1:] > 0).float() 
